@@ -1,288 +1,115 @@
 import { NextRequest, NextResponse } from 'next/server';
+
+import { formatPortalAccount, loadPermittedPortalAccounts, normalizePortalEmail } from '@/lib/portalAccounts';
+import {
+  PortalRateLimitUnavailableError,
+  enforcePortalRateLimits,
+  getRequestIp,
+} from '@/lib/portalRateLimit';
+import {
+  PORTAL_SESSION_COOKIE,
+  createPortalSessionToken,
+  portalSessionCookieOptions,
+} from '@/lib/portalSession';
 import { supabaseAdmin } from '@/lib/supabase';
 
-// Brute force protection - track failed attempts
-const failedAttemptsMap = new Map<string, { count: number; lockoutUntil: number }>();
-const MAX_FAILED_ATTEMPTS = 5;
-const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 minutes lockout after too many failures
-const ATTEMPT_WINDOW = 5 * 60 * 1000; // Count attempts within 5 minute window
-
-// Rate limiting
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 10; // 10 attempts per minute
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const record = rateLimitMap.get(ip);
-
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return false;
-  }
-
-  if (record.count >= RATE_LIMIT_MAX) {
-    return true;
-  }
-
-  record.count++;
-  return false;
-}
-
-function checkBruteForce(email: string): { blocked: boolean; remainingTime?: number } {
-  const now = Date.now();
-  const record = failedAttemptsMap.get(email);
-
-  if (!record) {
-    return { blocked: false };
-  }
-
-  // Check if currently locked out
-  if (record.lockoutUntil > now) {
-    return { blocked: true, remainingTime: Math.ceil((record.lockoutUntil - now) / 1000 / 60) };
-  }
-
-  // Reset if window has passed
-  if (now - record.lockoutUntil > ATTEMPT_WINDOW) {
-    failedAttemptsMap.delete(email);
-    return { blocked: false };
-  }
-
-  return { blocked: false };
-}
-
-function recordFailedAttempt(email: string): void {
-  const now = Date.now();
-  const record = failedAttemptsMap.get(email);
-
-  if (!record || now > record.lockoutUntil + ATTEMPT_WINDOW) {
-    failedAttemptsMap.set(email, { count: 1, lockoutUntil: 0 });
-    return;
-  }
-
-  record.count++;
-
-  if (record.count >= MAX_FAILED_ATTEMPTS) {
-    record.lockoutUntil = now + LOCKOUT_DURATION;
-  }
-}
-
-function clearFailedAttempts(email: string): void {
-  failedAttemptsMap.delete(email);
+function noStoreJson(body: Record<string, unknown>, init?: ResponseInit) {
+  const response = NextResponse.json(body, init);
+  response.headers.set('Cache-Control', 'no-store');
+  return response;
 }
 
 export async function POST(request: NextRequest) {
   try {
-    // Rate limiting
-    const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
-    if (isRateLimited(ip)) {
-      return NextResponse.json(
-        { error: 'Too many requests. Please wait and try again.' },
-        { status: 429 }
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const normalizedEmail = normalizePortalEmail(body?.email);
+    const normalizedPin = typeof body?.pin === 'string'
+      ? body.pin.toUpperCase().trim()
+      : '';
+
+    if (!normalizedEmail || !/^[A-Z0-9]{6}$/.test(normalizedPin)) {
+      return noStoreJson(
+        { error: 'A valid email and six-character verification code are required' },
+        { status: 400 },
       );
     }
 
-    const { email, pin } = await request.json();
+    const rateLimit = await enforcePortalRateLimits(supabaseAdmin, [
+      {
+        scope: 'verify_pin_ip',
+        subject: getRequestIp(request.headers),
+        limit: 20,
+        windowSeconds: 5 * 60,
+      },
+      {
+        scope: 'verify_pin_email',
+        subject: normalizedEmail,
+        limit: 5,
+        windowSeconds: 15 * 60,
+      },
+    ]);
 
-    if (!email || !pin) {
-      return NextResponse.json(
-        { error: 'Email and PIN are required' },
-        { status: 400 }
+    if (!rateLimit.allowed) {
+      return noStoreJson(
+        { error: 'Too many verification attempts. Please request a new code later.' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+        },
       );
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
-    const normalizedPin = pin.toUpperCase().trim();
-
-    // Check brute force protection
-    const bruteForceCheck = checkBruteForce(normalizedEmail);
-    if (bruteForceCheck.blocked) {
-      return NextResponse.json(
-        { error: `Too many failed attempts. Please try again in ${bruteForceCheck.remainingTime} minutes.` },
-        { status: 429 }
-      );
-    }
-
-    // Find the PIN record
+    // Atomically claim a valid PIN. Concurrent replays re-check verified=false
+    // after the winning update commits, so only one request can receive a session.
     const { data: pinRecord, error: pinError } = await supabaseAdmin
       .from('verification_pins')
-      .select('*')
+      .update({ verified: true })
       .eq('email', normalizedEmail)
       .eq('pin', normalizedPin)
       .eq('verified', false)
-      .single();
+      .gt('expires_at', new Date().toISOString())
+      .select('id')
+      .maybeSingle();
 
-    if (pinError || !pinRecord) {
-      // Record failed attempt for brute force protection
-      recordFailedAttempt(normalizedEmail);
-      return NextResponse.json(
-        { error: 'Invalid verification code' },
-        { status: 400 }
+    if (pinError) {
+      console.error('Could not claim portal PIN:', pinError);
+      return noStoreJson({ error: 'Could not verify the code' }, { status: 500 });
+    }
+    if (!pinRecord) {
+      return noStoreJson(
+        { error: 'Invalid or expired verification code' },
+        { status: 400 },
       );
     }
 
-    // Check if PIN has expired
-    const expiresAt = new Date(pinRecord.expires_at);
-    if (expiresAt < new Date()) {
-      // Delete expired PIN
-      await supabaseAdmin
-        .from('verification_pins')
-        .delete()
-        .eq('id', pinRecord.id);
-
-      return NextResponse.json(
-        { error: 'Verification code has expired. Please request a new one.' },
-        { status: 400 }
+    const accounts = await loadPermittedPortalAccounts(supabaseAdmin, normalizedEmail);
+    if (accounts.length === 0) {
+      return noStoreJson(
+        { error: 'No active portal accounts are available for this login' },
+        { status: 403 },
       );
     }
 
-    // Mark PIN as verified
-    await supabaseAdmin
-      .from('verification_pins')
-      .update({ verified: true })
-      .eq('id', pinRecord.id);
-
-    // Clear failed attempts on successful verification
-    clearFailedAttempts(normalizedEmail);
-
-    // Sanitize email for ILIKE query
-    const sanitizedEmail = normalizedEmail.replace(/%/g, '\\%').replace(/_/g, '\\_');
-
-    // Get ALL customer accounts linked to this email (excluding disabled accounts)
-    const { data: accounts, error: accountsError } = await supabaseAdmin
-      .from('customer_list')
-      .select(`
-        id,
-        customer,
-        first_name,
-        last_name,
-        full_name,
-        email,
-        business_name,
-        unique_reference,
-        billing_address,
-        billing_street,
-        billing_city,
-        billing_postcode,
-        shipping_address,
-        shipping_city,
-        shipping_postcode,
-        collection_address,
-        collection_city,
-        collection_postcode,
-        phone,
-        contact_number_1,
-        contact_number_2,
-        customer_type,
-        payment_terms,
-        create_date,
-        what3words,
-        special_instructions,
-        disabled
-      `)
-      .or(`email.ilike.%${sanitizedEmail}%`);
-
-    if (accountsError) {
-      console.error('Error fetching accounts:', accountsError);
-      return NextResponse.json(
-        { error: 'Failed to fetch accounts' },
-        { status: 500 }
-      );
-    }
-
-    // Find all parent/child account families
-    // Extract base references (e.g. "MR-00373" from "MR-00373-C1")
-    const activeAccounts = (accounts || []).filter(
-      account => account.disabled !== true && account.disabled !== 'true'
-    );
-    const baseRefs = new Set<string>();
-    for (const account of activeAccounts) {
-      const ref = account.unique_reference || '';
-      // Strip child suffix like -C1, -C2 to get parent reference
-      const baseRef = ref.replace(/-C\d+$/, '');
-      if (baseRef) baseRefs.add(baseRef);
-    }
-
-    // Fetch all related parent/child accounts for matched families
-    let allFamilyAccounts = activeAccounts;
-    if (baseRefs.size > 0) {
-      // Match exact parent ref OR children with -C suffix only (avoids over-matching)
-      const orFilter = Array.from(baseRefs)
-        .flatMap(ref => [
-          `unique_reference.eq.${ref}`,
-          `unique_reference.like.${ref}-C%`
-        ])
-        .join(',');
-      const { data: familyAccounts, error: familyError } = await supabaseAdmin
-        .from('customer_list')
-        .select(`
-          id, customer, first_name, last_name, full_name, email,
-          business_name, unique_reference, billing_address, billing_street,
-          billing_city, billing_postcode, shipping_address, shipping_city,
-          shipping_postcode, collection_address, collection_city,
-          collection_postcode, phone, contact_number_1, contact_number_2,
-          customer_type, payment_terms, create_date, what3words,
-          special_instructions, disabled
-        `)
-        .or(orFilter);
-
-      if (familyError) {
-        console.error('Error fetching family accounts:', familyError);
-      }
-
-      if (familyAccounts) {
-        // Merge: use family accounts but deduplicate by id
-        const seen = new Set<number>();
-        allFamilyAccounts = [];
-        for (const acc of familyAccounts) {
-          if (acc.disabled === true || acc.disabled === 'true') continue;
-          if (!seen.has(acc.id)) {
-            seen.add(acc.id);
-            allFamilyAccounts.push(acc);
-          }
-        }
-      }
-    }
-
-    // Format accounts
-    const formattedAccounts = allFamilyAccounts
-      .map(account => ({
-        id: account.id,
-        name: account.business_name || account.customer || account.full_name || `${account.first_name || ''} ${account.last_name || ''}`.trim(),
-        firstName: account.first_name,
-        lastName: account.last_name,
-        businessName: account.business_name,
-        reference: account.unique_reference,
-        email: account.email,
-        phone: account.contact_number_1 || account.phone,
-        phone2: account.contact_number_2,
-        billingAddress: account.billing_address,
-        billingCity: account.billing_city,
-        billingPostcode: account.billing_postcode,
-        shippingAddress: account.shipping_address,
-        shippingCity: account.shipping_city,
-        shippingPostcode: account.shipping_postcode,
-        collectionAddress: account.collection_address,
-        collectionCity: account.collection_city,
-        collectionPostcode: account.collection_postcode,
-        customerType: account.customer_type,
-        paymentTerms: account.payment_terms,
-        customerSince: account.create_date,
-        what3words: account.what3words,
-        specialInstructions: account.special_instructions,
-      }));
-
-    return NextResponse.json({
+    const response = noStoreJson({
       success: true,
       message: 'Verification successful',
-      accounts: formattedAccounts,
-      email: normalizedEmail,
+      accounts: accounts.map(formatPortalAccount),
     });
-  } catch (error) {
-    console.error('Server error:', error);
-    return NextResponse.json(
-      { error: 'Server error' },
-      { status: 500 }
+    response.cookies.set(
+      PORTAL_SESSION_COOKIE,
+      createPortalSessionToken(normalizedEmail),
+      portalSessionCookieOptions(),
     );
+    return response;
+  } catch (error) {
+    if (error instanceof PortalRateLimitUnavailableError) {
+      console.error(error.message);
+      return noStoreJson(
+        { error: 'Verification is temporarily unavailable. Please try again shortly.' },
+        { status: 503 },
+      );
+    }
+    console.error('Portal verification error:', error);
+    return noStoreJson({ error: 'Server error' }, { status: 500 });
   }
 }

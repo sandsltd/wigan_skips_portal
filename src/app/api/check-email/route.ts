@@ -1,99 +1,55 @@
 import { NextRequest, NextResponse } from 'next/server';
+
+import { normalizePortalEmail } from '@/lib/portalAccounts';
+import {
+  PortalRateLimitUnavailableError,
+  enforcePortalRateLimits,
+  getRequestIp,
+} from '@/lib/portalRateLimit';
 import { supabaseAdmin } from '@/lib/supabase';
 
-// Simple in-memory rate limiting (use Redis in production for multi-instance)
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 5; // 5 requests per minute
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const record = rateLimitMap.get(ip);
-
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return false;
-  }
-
-  if (record.count >= RATE_LIMIT_MAX) {
-    return true;
-  }
-
-  record.count++;
-  return false;
+function noStoreJson(body: Record<string, unknown>, init?: ResponseInit) {
+  const response = NextResponse.json(body, init);
+  response.headers.set('Cache-Control', 'no-store');
+  return response;
 }
 
-// Sanitize email for safe database queries
-function sanitizeEmail(email: string): string {
-  // Remove any SQL-like special characters and validate email format
-  const sanitized = email.toLowerCase().trim();
-  // Basic email validation
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(sanitized)) {
-    throw new Error('Invalid email format');
-  }
-  // Escape SQL wildcards
-  return sanitized.replace(/%/g, '\\%').replace(/_/g, '\\_');
-}
-
+// Retained for compatibility with older clients. It deliberately performs no
+// customer lookup and returns the same response for every valid email.
 export async function POST(request: NextRequest) {
   try {
-    // Rate limiting
-    const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
-    if (isRateLimited(ip)) {
-      return NextResponse.json(
-        { error: 'Too many requests. Please try again later.' },
-        { status: 429 }
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const normalizedEmail = normalizePortalEmail(body?.email);
+    if (!normalizedEmail) {
+      return noStoreJson({ error: 'A valid email is required' }, { status: 400 });
+    }
+
+    const rateLimit = await enforcePortalRateLimits(supabaseAdmin, [{
+      scope: 'check_email_ip',
+      subject: getRequestIp(request.headers),
+      limit: 5,
+      windowSeconds: 60,
+    }]);
+    if (!rateLimit.allowed) {
+      return noStoreJson(
+        { error: 'Too many requests. Please wait and try again.' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+        },
       );
     }
 
-    const { email } = await request.json();
-
-    if (!email || typeof email !== 'string') {
-      return NextResponse.json(
-        { error: 'Email is required' },
-        { status: 400 }
-      );
-    }
-
-    let sanitizedEmail: string;
-    try {
-      sanitizedEmail = sanitizeEmail(email);
-    } catch {
-      return NextResponse.json(
-        { error: 'Invalid email format' },
-        { status: 400 }
-      );
-    }
-
-    // Search for customer by email using parameterized query pattern
-    // Use exact match or properly escaped ILIKE
-    const { data, error } = await supabaseAdmin
-      .from('customer_list')
-      .select('id, customer, email')
-      .or(`email.ilike.%${sanitizedEmail}%`)
-      .limit(1);
-
-    if (error) {
-      console.error('Database error:', error);
-      return NextResponse.json(
-        { error: 'Database error' },
-        { status: 500 }
-      );
-    }
-
-    const customerExists = data && data.length > 0;
-
-    // Don't reveal whether email exists (security through obscurity for enumeration attacks)
-    // Always return success and send PIN if email provided is valid format
-    return NextResponse.json({
-      exists: customerExists,
+    return noStoreJson({
+      success: true,
+      message: 'If this email is registered, a verification code can be requested.',
     });
   } catch (error) {
-    console.error('Server error:', error);
-    return NextResponse.json(
-      { error: 'Server error' },
-      { status: 500 }
-    );
+    if (error instanceof PortalRateLimitUnavailableError) {
+      console.error(error.message);
+      return noStoreJson({ error: 'Service temporarily unavailable' }, { status: 503 });
+    }
+    console.error('Portal email check error:', error);
+    return noStoreJson({ error: 'Server error' }, { status: 500 });
   }
 }

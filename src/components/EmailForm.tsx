@@ -22,25 +22,10 @@ export default function EmailForm({ onPinSent }: EmailFormProps) {
     setError(null);
 
     try {
-      // First check if customer exists
-      const checkResponse = await fetch('/api/check-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: email.trim() }),
-      });
-
-      const checkData = await checkResponse.json();
-
-      if (!checkResponse.ok || !checkData.exists) {
-        setError('No account found with this email address. Please contact support.');
-        setIsLoading(false);
-        return;
-      }
-
-      // Send PIN
       const pinResponse = await fetch('/api/send-pin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ email: email.trim() }),
       });
 
@@ -156,7 +141,7 @@ export default function EmailForm({ onPinSent }: EmailFormProps) {
             animate={{ opacity: 1 }}
             transition={{ delay: 0.6 }}
           >
-            We&apos;ll send a secure PIN to verify your identity
+            If your email is registered, we&apos;ll send a secure PIN
           </motion.p>
         )}
       </AnimatePresence>

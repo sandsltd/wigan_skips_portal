@@ -1,37 +1,40 @@
 import { NextRequest, NextResponse } from 'next/server';
+
+import { loadPermittedPortalAccounts } from '@/lib/portalAccounts';
+import { isPortalDocumentVisible } from '@/lib/portalDocuments';
+import {
+  PortalRateLimitUnavailableError,
+  enforcePortalRateLimits,
+  getRequestIp,
+} from '@/lib/portalRateLimit';
+import { PORTAL_SESSION_COOKIE, verifyPortalSessionToken } from '@/lib/portalSession';
 import { supabaseAdmin } from '@/lib/supabase';
 
 const BUCKET_NAME = 'customer-documents';
-const SIGNED_URL_EXPIRY = 3600; // 1 hour in seconds
+const SIGNED_URL_EXPIRY = 5 * 60;
 
-// Rate limiting for document requests
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 20; // 20 requests per minute
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const record = rateLimitMap.get(ip);
-
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return false;
-  }
-
-  if (record.count >= RATE_LIMIT_MAX) {
-    return true;
-  }
-
-  record.count++;
-  return false;
+function noStoreJson(body: Record<string, unknown>, init?: ResponseInit) {
+  const response = NextResponse.json(body, init);
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('Vary', 'Cookie');
+  return response;
 }
 
-// Validate customer reference format (prevent path traversal)
+function unauthorizedResponse() {
+  const response = noStoreJson({ error: 'Please sign in to view documents' }, { status: 401 });
+  response.cookies.set(PORTAL_SESSION_COOKIE, '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    path: '/',
+    maxAge: 0,
+  });
+  return response;
+}
+
 function isValidReference(ref: string): boolean {
   if (!ref || ref.length > 50) return false;
-  // Block path traversal attempts
   if (ref.includes('..') || ref.includes('/') || ref.includes('\\')) return false;
-  // Allow alphanumeric, hyphens, underscores, spaces
   return /^[A-Za-z0-9\-_ ]+$/.test(ref);
 }
 
@@ -45,15 +48,19 @@ interface Document {
   url: string;
 }
 
-// Parse document filename to extract type and date
-function parseDocumentName(filename: string): { type: Document['type']; date: string | null; displayName: string } {
-  const lowerName = filename.toLowerCase();
+interface DocumentMetadata {
+  storage_path: string;
+  portal_visible: unknown;
+  document_type: string | null;
+  display_name: string | null;
+}
 
+function parseDocumentName(filename: string): Pick<Document, 'type' | 'date' | 'displayName'> {
+  const lowerName = filename.toLowerCase();
   let type: Document['type'] = 'other';
   let date: string | null = null;
-  let displayName = filename.replace(/\.[^/.]+$/, ''); // Remove extension
+  let displayName = filename.replace(/\.[^/.]+$/, '');
 
-  // Detect document type
   if (lowerName.includes('waste_transfer_note') || lowerName.includes('wtn')) {
     type = 'waste_transfer_note';
     displayName = 'Waste Transfer Note';
@@ -65,129 +72,148 @@ function parseDocumentName(filename: string): { type: Document['type']; date: st
     displayName = 'Invoice';
   }
 
-  // Try to extract date from filename
-  // Format 1: YYYY-MM-DD (e.g., 2025-12-17)
   let dateMatch = filename.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (dateMatch) {
     const [, year, month, day] = dateMatch;
     date = `${year}-${month}-${day}`;
   }
 
-  // Format 2: DD-MM-YYYY (e.g., 17-12-2025)
   if (!date) {
     dateMatch = filename.match(/(\d{2})-(\d{2})-(\d{4})/);
     if (dateMatch) {
       const [, day, month, year] = dateMatch;
-      date = `${year}-${month}-${day}`; // Convert to YYYY-MM-DD for consistent sorting
+      date = `${year}-${month}-${day}`;
     }
   }
 
-  // Format date for display
   if (date) {
-    try {
-      const dateObj = new Date(date);
-      // Check if valid date
-      if (!isNaN(dateObj.getTime())) {
-        const formattedDate = dateObj.toLocaleDateString('en-GB', {
-          day: 'numeric',
-          month: 'short',
-          year: 'numeric'
-        });
-        displayName = `${displayName} - ${formattedDate}`;
-      }
-    } catch {
-      displayName = `${displayName} - ${date}`;
+    const dateObject = new Date(date);
+    if (!Number.isNaN(dateObject.getTime())) {
+      displayName = `${displayName} - ${dateObject.toLocaleDateString('en-GB', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+      })}`;
     }
   }
 
   return { type, date, displayName };
 }
 
+function asDocumentMetadata(value: unknown): DocumentMetadata[] {
+  return Array.isArray(value) ? value as DocumentMetadata[] : [];
+}
+
+function metadataDocumentType(value: string | null | undefined): Document['type'] | null {
+  if (value === 'wtn' || value === 'waste_transfer_note') return 'waste_transfer_note';
+  if (value === 'certificate') return 'certificate';
+  if (value === 'invoice') return 'invoice';
+  if (value && ['agreement', 'verification', 'weighbridge', 'other'].includes(value)) return 'other';
+  return null;
+}
+
 export async function GET(request: NextRequest) {
   try {
-    // Rate limiting
-    const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
-    if (isRateLimited(ip)) {
-      return NextResponse.json(
-        { error: 'Too many requests. Please try again later.' },
-        { status: 429 }
-      );
-    }
+    const token = request.cookies.get(PORTAL_SESSION_COOKIE)?.value;
+    const session = verifyPortalSessionToken(token);
+    if (!session) return unauthorizedResponse();
 
-    const { searchParams } = new URL(request.url);
-    const customerRef = searchParams.get('ref');
-
-    if (!customerRef) {
-      return NextResponse.json(
-        { error: 'Customer reference is required' },
-        { status: 400 }
-      );
-    }
-
-    // Validate reference format to prevent path traversal and injection
+    const customerRef = request.nextUrl.searchParams.get('ref')?.trim() || '';
     if (!isValidReference(customerRef)) {
-      return NextResponse.json(
-        { error: 'Invalid customer reference format' },
-        { status: 400 }
+      return noStoreJson({ error: 'A valid customer reference is required' }, { status: 400 });
+    }
+
+    const rateLimit = await enforcePortalRateLimits(supabaseAdmin, [
+      {
+        scope: 'documents_ip',
+        subject: getRequestIp(request.headers),
+        limit: 60,
+        windowSeconds: 60,
+      },
+      {
+        scope: 'documents_session',
+        subject: session.email,
+        limit: 30,
+        windowSeconds: 60,
+      },
+    ]);
+    if (!rateLimit.allowed) {
+      return noStoreJson(
+        { error: 'Too many document requests. Please wait and try again.' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+        },
       );
     }
 
-    // List files in customer's folder
+    const permittedAccounts = await loadPermittedPortalAccounts(supabaseAdmin, session.email);
+    const permittedReferences = new Set(
+      permittedAccounts
+        .map((account) => account.unique_reference?.trim().toUpperCase())
+        .filter((reference): reference is string => Boolean(reference)),
+    );
     const folderPath = customerRef.toUpperCase();
-    const { data: files, error: listError } = await supabaseAdmin
-      .storage
-      .from(BUCKET_NAME)
-      .list(folderPath, {
-        limit: 100,
-        sortBy: { column: 'created_at', order: 'desc' }
-      });
+    if (!permittedReferences.has(folderPath)) {
+      return noStoreJson({ error: 'This account is not available to your portal login' }, { status: 403 });
+    }
 
+    const documentsBucket = supabaseAdmin.storage.from(BUCKET_NAME);
+    const { data: files, error: listError } = await documentsBucket.list(folderPath, {
+      limit: 100,
+      sortBy: { column: 'created_at', order: 'desc' },
+    });
     if (listError) {
-      console.error('Error listing files:', listError);
-      return NextResponse.json(
-        { error: 'Failed to list documents' },
-        { status: 500 }
+      console.error('Error listing portal documents:', listError);
+      return noStoreJson({ error: 'Failed to list documents' }, { status: 500 });
+    }
+
+    const storedFiles = (files || []).filter((file) => file.name && !file.name.startsWith('.'));
+    if (storedFiles.length === 0) return noStoreJson({ documents: [] });
+
+    const storagePaths = storedFiles.map((file) => `${folderPath}/${file.name}`);
+    const { data: metadataRows, error: metadataError } = await supabaseAdmin
+      .from('customer_document_metadata')
+      .select('storage_path, portal_visible, document_type, display_name')
+      .in('storage_path', storagePaths);
+    if (metadataError) {
+      console.error('Could not enforce portal document visibility:', metadataError);
+      return noStoreJson(
+        { error: 'Document visibility could not be verified' },
+        { status: 503 },
       );
     }
 
-    if (!files || files.length === 0) {
-      return NextResponse.json({ documents: [] });
-    }
-
-    // Filter out folders and generate signed URLs for each file
+    const metadataByPath = new Map(
+      asDocumentMetadata(metadataRows).map((metadata) => [metadata.storage_path, metadata]),
+    );
     const documents: Document[] = [];
 
-    for (const file of files) {
-      // Skip folders (they have no metadata/size)
-      if (!file.name || file.name.startsWith('.')) continue;
-
+    for (const file of storedFiles) {
       const filePath = `${folderPath}/${file.name}`;
+      const metadata = metadataByPath.get(filePath);
+      const visibility = metadata?.portal_visible ?? file.metadata?.portal_visible;
+      if (!isPortalDocumentVisible(visibility)) continue;
 
-      // Generate signed URL
-      const { data: signedUrlData, error: signError } = await supabaseAdmin
-        .storage
-        .from(BUCKET_NAME)
+      const { data: signedUrlData, error: signError } = await documentsBucket
         .createSignedUrl(filePath, SIGNED_URL_EXPIRY);
-
       if (signError || !signedUrlData) {
-        console.error(`Error creating signed URL for ${filePath}:`, signError);
+        console.error(`Error creating a portal document URL for ${filePath}:`, signError);
         continue;
       }
 
-      const { type, date, displayName } = parseDocumentName(file.name);
-
+      const parsed = parseDocumentName(file.name);
       documents.push({
         id: file.id || file.name,
         name: file.name,
-        displayName,
-        type,
-        date,
+        displayName: metadata?.display_name || parsed.displayName,
+        type: metadataDocumentType(metadata?.document_type) || parsed.type,
+        date: parsed.date,
         size: file.metadata?.size || 0,
         url: signedUrlData.signedUrl,
       });
     }
 
-    // Sort by date (newest first)
     documents.sort((a, b) => {
       if (!a.date && !b.date) return 0;
       if (!a.date) return 1;
@@ -195,12 +221,16 @@ export async function GET(request: NextRequest) {
       return b.date.localeCompare(a.date);
     });
 
-    return NextResponse.json({ documents });
+    return noStoreJson({ documents });
   } catch (error) {
-    console.error('Server error:', error);
-    return NextResponse.json(
-      { error: 'Server error' },
-      { status: 500 }
-    );
+    if (error instanceof PortalRateLimitUnavailableError) {
+      console.error(error.message);
+      return noStoreJson(
+        { error: 'Document access is temporarily unavailable. Please try again shortly.' },
+        { status: 503 },
+      );
+    }
+    console.error('Portal document error:', error);
+    return noStoreJson({ error: 'Server error' }, { status: 500 });
   }
 }

@@ -66,7 +66,9 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
       }
 
       try {
-        const response = await fetch(`/api/documents?ref=${encodeURIComponent(account.reference)}`);
+        const response = await fetch(`/api/documents?ref=${encodeURIComponent(account.reference)}`, {
+          cache: 'no-store',
+        });
         const data = await response.json();
 
         if (!response.ok) {
@@ -345,7 +347,7 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
                     className="inline-flex items-center gap-1.5 mt-2 text-sm text-[var(--color-primary)] hover:underline"
                   >
                     <MapPinned size={14} />
-                    ///{account.what3words}
+                    {'///'}{account.what3words}
                   </a>
                 )}
               </div>

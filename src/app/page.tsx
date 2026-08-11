@@ -58,7 +58,11 @@ function HomeContent() {
     setStep('accounts');
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await fetch('/api/logout', {
+      method: 'POST',
+      cache: 'no-store',
+    }).catch(() => undefined);
     setStep('email');
     setEmail('');
     setAccounts([]);

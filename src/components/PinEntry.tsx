@@ -82,6 +82,7 @@ export default function PinEntry({ email, onVerified, onBack }: PinEntryProps) {
       const response = await fetch('/api/verify-pin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ email, pin: pinCode }),
       });
 
@@ -109,6 +110,7 @@ export default function PinEntry({ email, onVerified, onBack }: PinEntryProps) {
       const response = await fetch('/api/send-pin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ email }),
       });
 

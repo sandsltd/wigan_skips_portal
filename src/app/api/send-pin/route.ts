@@ -1,179 +1,123 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase';
+import { after, NextRequest, NextResponse } from 'next/server';
+
 import { sendPinEmail, generatePin } from '@/lib/email';
+import { findDirectPortalAccounts, normalizePortalEmail } from '@/lib/portalAccounts';
+import {
+  PortalRateLimitUnavailableError,
+  enforcePortalRateLimits,
+  getRequestIp,
+} from '@/lib/portalRateLimit';
+import { supabaseAdmin } from '@/lib/supabase';
 
-// Rate limiting for PIN requests (stricter than email check)
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 3; // Only 3 PIN requests per minute per IP
+const MINIMUM_RESPONSE_TIME_MS = 600;
+const GENERIC_RESPONSE = {
+  success: true,
+  message: 'If this email is registered, a verification code has been sent.',
+};
 
-// Track email-based rate limiting to prevent spam
-const emailRateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const EMAIL_RATE_LIMIT_WINDOW = 5 * 60 * 1000; // 5 minutes
-const EMAIL_RATE_LIMIT_MAX = 3; // Only 3 PINs per email per 5 minutes
-
-function isRateLimited(ip: string): boolean {
-  const now = Date.now();
-  const record = rateLimitMap.get(ip);
-
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return false;
-  }
-
-  if (record.count >= RATE_LIMIT_MAX) {
-    return true;
-  }
-
-  record.count++;
-  return false;
+function noStoreJson(body: Record<string, unknown>, init?: ResponseInit) {
+  const response = NextResponse.json(body, init);
+  response.headers.set('Cache-Control', 'no-store');
+  return response;
 }
 
-function isEmailRateLimited(email: string): boolean {
-  const now = Date.now();
-  const record = emailRateLimitMap.get(email);
-
-  if (!record || now > record.resetTime) {
-    emailRateLimitMap.set(email, { count: 1, resetTime: now + EMAIL_RATE_LIMIT_WINDOW });
-    return false;
-  }
-
-  if (record.count >= EMAIL_RATE_LIMIT_MAX) {
-    return true;
-  }
-
-  record.count++;
-  return false;
-}
-
-// Sanitize and validate email
-function sanitizeEmail(email: string): string {
-  const sanitized = email.toLowerCase().trim();
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(sanitized)) {
-    throw new Error('Invalid email format');
-  }
-  return sanitized.replace(/%/g, '\\%').replace(/_/g, '\\_');
+async function waitForMinimumResponseTime(startedAt: number) {
+  const remaining = MINIMUM_RESPONSE_TIME_MS - (Date.now() - startedAt);
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
 }
 
 export async function POST(request: NextRequest) {
+  const startedAt = Date.now();
+
   try {
-    // IP-based rate limiting
-    const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
-    if (isRateLimited(ip)) {
-      return NextResponse.json(
-        { error: 'Too many requests. Please wait a minute and try again.' },
-        { status: 429 }
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const normalizedEmail = normalizePortalEmail(body?.email);
+    if (!normalizedEmail) {
+      return noStoreJson({ error: 'A valid email is required' }, { status: 400 });
+    }
+
+    const rateLimit = await enforcePortalRateLimits(supabaseAdmin, [
+      {
+        scope: 'send_pin_ip',
+        subject: getRequestIp(request.headers),
+        limit: 3,
+        windowSeconds: 60,
+      },
+      {
+        scope: 'send_pin_email',
+        subject: normalizedEmail,
+        limit: 3,
+        windowSeconds: 5 * 60,
+      },
+    ]);
+    if (!rateLimit.allowed) {
+      return noStoreJson(
+        { error: 'Too many verification requests. Please wait and try again.' },
+        {
+          status: 429,
+          headers: { 'Retry-After': String(rateLimit.retryAfterSeconds) },
+        },
       );
     }
 
-    const { email } = await request.json();
-
-    if (!email || typeof email !== 'string') {
-      return NextResponse.json(
-        { error: 'Email is required' },
-        { status: 400 }
-      );
+    const accounts = await findDirectPortalAccounts(supabaseAdmin, normalizedEmail);
+    const customer = accounts[0];
+    if (!customer) {
+      await waitForMinimumResponseTime(startedAt);
+      return noStoreJson(GENERIC_RESPONSE);
     }
 
-    let sanitizedEmail: string;
-    try {
-      sanitizedEmail = sanitizeEmail(email);
-    } catch {
-      return NextResponse.json(
-        { error: 'Invalid email format' },
-        { status: 400 }
-      );
-    }
-
-    // Email-based rate limiting
-    if (isEmailRateLimited(sanitizedEmail)) {
-      return NextResponse.json(
-        { error: 'Too many verification requests for this email. Please wait 5 minutes.' },
-        { status: 429 }
-      );
-    }
-
-    // Check if customer exists
-    const { data: customer, error: customerError } = await supabaseAdmin
-      .from('customer_list')
-      .select('id, customer, first_name, email')
-      .or(`email.ilike.%${sanitizedEmail}%`)
-      .limit(1)
-      .single();
-
-    if (customerError || !customer) {
-      return NextResponse.json(
-        { error: 'Customer not found' },
-        { status: 404 }
-      );
-    }
-
-    // Generate PIN
     const pin = generatePin();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes from now
-
-    // Get the actual email for database operations (without escape chars)
-    const dbEmail = email.toLowerCase().trim();
-
-    // Delete any existing unused PINs for this email
-    await supabaseAdmin
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    const { error: deleteError } = await supabaseAdmin
       .from('verification_pins')
       .delete()
-      .eq('email', dbEmail)
+      .eq('email', normalizedEmail)
       .eq('verified', false);
+    if (deleteError) throw deleteError;
 
-    // Store PIN in database
-    const { error: pinError } = await supabaseAdmin
+    const { data: pinRecord, error: pinError } = await supabaseAdmin
       .from('verification_pins')
       .insert({
-        email: dbEmail,
-        pin: pin.toUpperCase(),
+        email: normalizedEmail,
+        pin,
         expires_at: expiresAt.toISOString(),
         verified: false,
         customer_id: customer.id,
-      });
+      })
+      .select('id')
+      .single();
+    if (pinError || !pinRecord) throw pinError || new Error('PIN record was not created');
 
-    if (pinError) {
-      console.error('Failed to store PIN:', pinError);
-      return NextResponse.json(
-        { error: 'Failed to generate verification code' },
-        { status: 500 }
-      );
-    }
-
-    // Send email
-    try {
-      await sendPinEmail(
-        dbEmail,
-        pin,
-        customer.first_name || customer.customer
-      );
-    } catch (emailError) {
-      console.error('Failed to send email:', emailError);
-      // Clean up the PIN if email fails
-      await supabaseAdmin
-        .from('verification_pins')
-        .delete()
-        .eq('email', dbEmail)
-        .eq('pin', pin);
-
-      return NextResponse.json(
-        { error: 'Failed to send verification email' },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      message: 'Verification code sent to your email',
-      email: dbEmail,
+    // Run provider delivery after the uniform HTTP response. This prevents
+    // email-provider latency from becoming an account-enumeration signal.
+    after(async () => {
+      try {
+        await sendPinEmail(
+          normalizedEmail,
+          pin,
+          customer.first_name || customer.customer || undefined,
+        );
+      } catch (emailError) {
+        console.error('Portal PIN delivery failed:', emailError);
+        await supabaseAdmin.from('verification_pins').delete().eq('id', pinRecord.id);
+      }
     });
+
+    await waitForMinimumResponseTime(startedAt);
+    return noStoreJson(GENERIC_RESPONSE);
   } catch (error) {
-    console.error('Server error:', error);
-    return NextResponse.json(
-      { error: 'Server error' },
-      { status: 500 }
+    if (error instanceof PortalRateLimitUnavailableError) {
+      console.error(error.message);
+      return noStoreJson(
+        { error: 'Verification is temporarily unavailable. Please try again shortly.' },
+        { status: 503 },
+      );
+    }
+    console.error('Portal PIN request error:', error);
+    return noStoreJson(
+      { error: 'Verification is temporarily unavailable. Please try again shortly.' },
+      { status: 503 },
     );
   }
 }

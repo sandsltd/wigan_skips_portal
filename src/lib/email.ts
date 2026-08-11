@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { Resend } from 'resend';
 import { getBusinessConfig } from './supabase';
 
@@ -189,7 +190,7 @@ ${config.emailAddress ? `Email: ${config.emailAddress}` : ''}
 ${config.businessName}
   `.trim();
 
-  await getResend().emails.send({
+  const { error } = await getResend().emails.send({
     from: `${config.businessName} <noreply@saunders-simmons.co.uk>`,
     to: to,
     replyTo: config.emailAddress,
@@ -197,6 +198,7 @@ ${config.businessName}
     text: text,
     html: html,
   });
+  if (error) throw new Error(`Email provider rejected the PIN message: ${error.message}`);
 }
 
 const ITEM_LABELS: Record<string, string> = {
@@ -596,11 +598,10 @@ export function generatePin(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let pin = '';
 
-  const crypto = require('crypto');
-  const randomBytes = crypto.randomBytes(6);
+  const bytes = randomBytes(6);
 
   for (let i = 0; i < 6; i++) {
-    pin += chars.charAt(randomBytes[i] % chars.length);
+    pin += chars.charAt(bytes[i] % chars.length);
   }
   return pin;
 }
