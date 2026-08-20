@@ -23,11 +23,13 @@ import {
   File,
   Eye,
   Download,
+  Send,
 } from 'lucide-react';
 import Image from 'next/image';
 import type { Account } from './AccountSelector';
 import DocumentViewer from './DocumentViewer';
 import ContactModal from './ContactModal';
+import ServiceRequestModal from './ServiceRequestModal';
 import { useBusinessConfig } from '@/lib/BusinessConfigContext';
 
 interface Document {
@@ -54,6 +56,7 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
   const [documentsError, setDocumentsError] = useState<string | null>(null);
   const [viewerDocument, setViewerDocument] = useState<Document | null>(null);
   const [showContact, setShowContact] = useState(false);
+  const [showServiceRequest, setShowServiceRequest] = useState(false);
 
   const logoSrc = config.logoUrl || '/logo.png';
   const isRemoteLogo = logoSrc.startsWith('http');
@@ -320,6 +323,21 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
         {/* Sidebar */}
         <div className="lg:col-span-4 space-y-3 sm:space-y-4 order-2">
 
+          {/* Service Request Card */}
+          <div className="rounded-xl bg-gradient-to-br from-[var(--color-primary)] to-[var(--color-primary-light)] p-4 text-white shadow-sm sm:rounded-2xl sm:p-5">
+            <h3 className="font-semibold text-sm sm:text-base">Need a collection, delivery or exchange?</h3>
+            <p className="mt-1 text-xs text-white/80 sm:text-sm">
+              Send the team the details and they will contact you to confirm.
+            </p>
+            <button
+              onClick={() => setShowServiceRequest(true)}
+              className="mt-4 inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2.5 text-sm font-semibold text-[var(--color-primary)] transition-opacity hover:opacity-90"
+            >
+              <Send size={16} />
+              Request a service
+            </button>
+          </div>
+
           {/* Collection Address Card */}
           <div className="bg-white rounded-xl sm:rounded-2xl shadow-sm border border-gray-100 p-4 sm:p-5">
             <div className="flex items-center gap-2 mb-3 sm:mb-4">
@@ -450,6 +468,13 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
 
       {/* Contact Modal */}
       <ContactModal isOpen={showContact} onClose={() => setShowContact(false)} />
+
+      {/* Service Request Modal */}
+      <ServiceRequestModal
+        isOpen={showServiceRequest}
+        onClose={() => setShowServiceRequest(false)}
+        account={account}
+      />
 
       {/* Document Viewer Modal */}
       <DocumentViewer
