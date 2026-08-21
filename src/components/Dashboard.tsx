@@ -23,12 +23,14 @@ import {
   File,
   Eye,
   Download,
+  BarChart3,
   Send,
 } from 'lucide-react';
 import Image from 'next/image';
 import type { Account } from './AccountSelector';
 import DocumentViewer from './DocumentViewer';
 import ContactModal from './ContactModal';
+import ReportsPanel from './ReportsPanel';
 import ServiceRequestModal from './ServiceRequestModal';
 import { useBusinessConfig } from '@/lib/BusinessConfigContext';
 
@@ -56,6 +58,7 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
   const [documentsError, setDocumentsError] = useState<string | null>(null);
   const [viewerDocument, setViewerDocument] = useState<Document | null>(null);
   const [showContact, setShowContact] = useState(false);
+  const [activeSection, setActiveSection] = useState<'documents' | 'reports'>('documents');
   const [showServiceRequest, setShowServiceRequest] = useState(false);
 
   const logoSrc = config.logoUrl || '/logo.png';
@@ -215,11 +218,46 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
         </div>
       </div>
 
+      <div
+        role="tablist"
+        aria-label="Portal sections"
+        className="mb-4 flex gap-1 rounded-xl border border-gray-100 bg-white p-1 shadow-sm sm:mb-6 sm:w-fit"
+      >
+        <button
+          role="tab"
+          aria-selected={activeSection === 'documents'}
+          onClick={() => setActiveSection('documents')}
+          className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors sm:flex-none ${
+            activeSection === 'documents'
+              ? 'bg-[var(--color-primary)] text-white'
+              : 'text-gray-500 hover:bg-gray-50 hover:text-gray-800'
+          }`}
+        >
+          <FileText size={16} /> Documents
+        </button>
+        <button
+          role="tab"
+          aria-selected={activeSection === 'reports'}
+          onClick={() => setActiveSection('reports')}
+          className={`flex flex-1 items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold transition-colors sm:flex-none ${
+            activeSection === 'reports'
+              ? 'bg-[var(--color-primary)] text-white'
+              : 'text-gray-500 hover:bg-gray-50 hover:text-gray-800'
+          }`}
+        >
+          <BarChart3 size={16} /> Reports
+        </button>
+      </div>
+
       {/* Main grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6">
 
         {/* Documents - Main content area */}
-        <div className="lg:col-span-8 order-1">
+        <div className={`${activeSection === 'reports' ? 'lg:col-span-12' : 'lg:col-span-8'} order-1`}>
+          {activeSection === 'reports' ? (
+            <ReportsPanel accountReference={account.reference} />
+          ) : (
+            <>
           <div className="bg-white rounded-xl sm:rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
             <div className="px-4 sm:px-6 py-3 sm:py-4 border-b border-gray-100">
               <h2 className="font-semibold text-gray-900 flex items-center gap-2 text-sm sm:text-base">
@@ -318,10 +356,13 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
               </div>
             </div>
           )}
+            </>
+          )}
         </div>
 
         {/* Sidebar */}
-        <div className="lg:col-span-4 space-y-3 sm:space-y-4 order-2">
+        {activeSection === 'documents' && (
+          <div className="lg:col-span-4 space-y-3 sm:space-y-4 order-2">
 
           {/* Service Request Card */}
           <div className="rounded-xl bg-gradient-to-br from-[var(--color-primary)] to-[var(--color-primary-light)] p-4 text-white shadow-sm sm:rounded-2xl sm:p-5">
@@ -446,7 +487,8 @@ export default function Dashboard({ account, email, onBack, onLogout }: Dashboar
               Contact support
             </button>
           </div>
-        </div>
+          </div>
+        )}
       </div>
 
       {/* Powered by PaperRoute footer */}
